@@ -6,3 +6,5 @@ __pycache__/
 # Remote files
 node_modules/
 dist/
+service_account.json
+
