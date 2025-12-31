@@ -51,7 +51,7 @@ MYSQL_CONFIG = {
 }
 
 SMTP_SERVER = "smtp-relay.brevo.com"
-SMTP_PORT = 587
+SMTP_PORT = 465
 SMTP_USER = "9da39b001@smtp-brevo.com"
 SMTP_PASS = os.getenv("BREVO_SMTP_PASS")
 FROM_EMAIL = "techpallotine@gmail.com"
@@ -583,14 +583,12 @@ def send_email_smtp(to_email, subject, html_body):
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
 
-        server = smtplib.SMTP(
+
+        server = smtplib.SMTP_SSL(
             SMTP_SERVER,
             SMTP_PORT,
             timeout=30
         )
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
         server.quit()
@@ -600,6 +598,7 @@ def send_email_smtp(to_email, subject, html_body):
     except Exception as e:
         print("❌ EMAIL ERROR:", repr(e))
         raise
+
 
 
 @app.route("/verify_forgot_otp", methods=["POST"])
