@@ -1,0 +1,28 @@
+# MongoDB Configuration
+MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/
+
+# SendGrid Email Configuration
+SENDGRID_API_KEY=your_sendgrid_api_key_here
+SENDGRID_PASSWORD=your_sendgrid_password_here
+
+# OpenAI API Configuration
+OPENAI_API_KEY=your_openai_api_key_here
+
+# Flask Configuration
+SECRET_KEY=your_secret_key_here
+PORT=5000
+
+# Redis Configuration (for caching and session management)
+REDIS_URL=redis://localhost:6379/0
+
+# AI Model Configuration
+AI_MODEL_CACHE_SIZE=1000
+AI_MODEL_UPDATE_INTERVAL=3600
+
+# Blockchain Configuration
+BLOCKCHAIN_NETWORK=mainnet
+CERTIFICATE_CONTRACT_ADDRESS=0x...
+
+# Monitoring and Analytics
+ENABLE_ANALYTICS=true
+LOG_LEVEL=INFO

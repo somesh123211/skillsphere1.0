@@ -1,143 +1,1870 @@
-from flask import Flask, request, jsonify
+# ============================================================
+# IMPORTS
+# ============================================================
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
-import smtplib
-from email.message import EmailMessage
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 from dotenv import load_dotenv
-import os, random
+import smtplib
+from email.mime.text import MIMEText
+import pymysql
+import mysql.connector
+import jwt
+import os
+import re
+import json
+import random
+import base64
+import uuid
+import smtplib
+from email.mime.text import MIMEText
+import google.generativeai as genai
 
-# Load environment variables
+
+from datetime import datetime, date, timedelta
+import pytz
+
+IST = pytz.timezone("Asia/Kolkata")
+
+def today_ist():
+    return datetime.now(IST).date()
+
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
 load_dotenv()
 
-# Flask app
+SECRET_KEY = os.getenv("SECRET_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY not found in .env")
+
+genai.configure(api_key=GOOGLE_API_KEY)
+
+MYSQL_CONFIG = {
+    "host": os.getenv("MYSQL_HOST"),
+    "user": os.getenv("MYSQL_USER"),
+    "password": os.getenv("MYSQL_PASSWORD"),
+    "database": os.getenv("MYSQL_DB"),
+}
+
+SMTP_SERVER = "smtp-relay.brevo.com"
+SMTP_PORT = 587
+SMTP_USER = "9da39b001@smtp-brevo.com"
+SMTP_PASS = os.getenv("BREVO_SMTP_PASS")
+FROM_EMAIL = "techpallotine@gmail.com"
+
+if not SECRET_KEY:
+    raise Exception("SECRET_KEY missing")
+if not GOOGLE_API_KEY:
+    raise Exception("GOOGLE_API_KEY missing")
+if not SMTP_PASS:
+    raise Exception("BREVO_SMTP_PASS missing")
+
+
+
+
+
+# ============================================================
+# FLASK SETUP
+# ============================================================
 app = Flask(__name__)
-CORS(app)
+app.config["SECRET_KEY"] = SECRET_KEY
+CORS(app, supports_credentials=True)
 
-# MongoDB URI from .env
-MONGO_URI = os.getenv("MONGO_URI")
 
-# SendGrid SMTP credentials from .env
-SMTP_SERVER = "smtp.sendgrid.net"
-SMTP_PORT = 587  # TLS
-SMTP_USERNAME = "apikey"  # fixed
-SMTP_PASSWORD = os.getenv("SENDGRID_PASSWORD")  # stored in .env
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# MongoDB connection
-try:
-    client = MongoClient(MONGO_URI, server_api=ServerApi('1'))
-    db = client["placement_db"]
-    students_collection = db["students"]
-    otp_collection = db["otp_temp"]
-    print("✅ MongoDB Connected Successfully!")
-except Exception as e:
-    print("❌ MongoDB Connection Error:", e)
+UPLOAD_FOLDER = os.path.join("uploads", "profile_images")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Helper function to send OTP via SMTP
-import requests
-import os
 
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+# ============================================================
+# GOOGLE GEMINI SETUP
+# ============================================================
+genai.configure(api_key=GOOGLE_API_KEY)
 
-def send_otp_email(email, otp):
-    url = "https://api.sendgrid.com/v3/mail/send"
-    headers = {
-        "Authorization": f"Bearer {SENDGRID_API_KEY}",
-        "Content-Type": "application/json"
+# ============================================================
+# DATABASE HELPER
+# ============================================================
+
+
+
+
+import mysql.connector
+from mysql.connector import Error
+
+def get_db():
+    return pymysql.connect(
+        host=MYSQL_CONFIG["host"],
+        user=MYSQL_CONFIG["user"],
+        password=MYSQL_CONFIG["password"],
+        database=MYSQL_CONFIG["database"],
+        autocommit=True,
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+
+# ============================================================
+# OTP CONFIG (IN-MEMORY)
+# ============================================================
+OTP_TTL_SECONDS = 5 * 60
+MAX_ATTEMPTS = 3
+
+otp_store = {}
+forgot_otp_store = {}
+
+
+def generate_otp():
+    return f"{random.randint(100000, 999999):06d}"
+
+
+def send_otp_email_only(email):
+    otp = generate_otp()
+    expires_at = datetime.utcnow() + timedelta(seconds=OTP_TTL_SECONDS)
+
+
+    otp_store[email.lower()] = {
+        "otp": otp,
+        "expires_at": expires_at,
+        "attempts": 0
     }
-    data = {
-        "personalizations": [{"to": [{"email": email}]}],
-        "from": {"email": "indra656778@gmail.com"},  # your verified sender
-        "subject": "Student Placement OTP",
-        "content": [{"type": "text/plain", "value": f"Your OTP is: {otp}"}]
-    }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 202:
-        print("OTP sent successfully to", email)
-        return True
-    else:
-        print("SendGrid Error:", response.status_code, response.text)
-        return False
+
+    html = load_html_template(
+        "otp_template.html",
+        otp=otp,
+        year = datetime.now().year
+
+    )
+
+    send_email_smtp(
+        email,
+        "Placement Portal Email Verification",
+        html
+    )
+
+    print("OTP sent (testing only):", otp)
 
 
-# Home route
-@app.route('/')
-def home():
-    return "Flask + MongoDB Atlas + SendGrid SMTP connected successfully!"
+def verify_otp(email, entered):
+    key = email.lower()
 
-# Signup route
-@app.route('/signup', methods=['POST'])
-def signup():
+    if key not in otp_store:
+        return False, "No OTP found"
+
+    entry = otp_store[key]
+
+    if datetime.utcnow() > entry["expires_at"]:
+
+        del otp_store[key]
+        return False, "OTP expired"
+
+    if entry["attempts"] >= MAX_ATTEMPTS:
+        del otp_store[key]
+        return False, "Maximum attempts exceeded"
+
+    entry["attempts"] += 1
+
+    if str(entered).strip() == entry["otp"]:
+        del otp_store[key]
+        return True, "OTP verified"
+
+    return False, "Invalid OTP"
+
+# ============================================================
+# SEND OTP
+# ============================================================
+@app.route("/send_otp", methods=["POST"])
+def send_otp():
     data = request.get_json()
-    name = data.get("name")
-    branch = data.get("branch")
     email = data.get("email")
-    year = data.get("year")
 
-    if not all([name, branch, email, year]):
-        return jsonify({"message": "All fields are required"}), 400
+    if not email:
+        return jsonify({"success": False, "message": "Email required"}), 400
 
-    if students_collection.find_one({"email": email}):
-        return jsonify({"message": "Email already registered"}), 400
+    send_otp_email_only(email)
+    return jsonify({"success": True, "message": "OTP sent"}), 200
+
+# ============================================================
+# VERIFY OTP & SIGNUP
+# ============================================================
+@app.route("/verify_otp_and_signup", methods=["POST"])
+def verify_otp_and_signup():
+    data = request.get_json()
+
+    required = ["name", "uid", "branch", "year", "email", "password", "otp"]
+    for field in required:
+        if not data.get(field):
+            return jsonify({"success": False, "message": f"{field} required"}), 400
+
+    ok, msg = verify_otp(data["email"], data["otp"])
+    if not ok:
+        return jsonify({"success": False, "message": msg}), 400
+
+    db = get_db()
+    cur = db.cursor()
+
+    cur.execute(
+        "SELECT id FROM students WHERE email=%s OR uid=%s",
+        (data["email"], data["uid"])
+    )
+    if cur.fetchone():
+        db.close()
+        return jsonify({"success": False, "message": "User already exists"}), 400
+
+    hashed = generate_password_hash(data["password"])
+
+    cur.execute("""
+        INSERT INTO students (name, uid, branch, year, email, password)
+        VALUES (%s,%s,%s,%s,%s,%s)
+    """, (
+        data["name"],
+        data["uid"],
+        data["branch"],
+        data["year"],
+        data["email"],
+        hashed
+    ))
+
+    db.commit()
+    db.close()
+
+    return jsonify({"success": True, "message": "Signup successful"}), 200
+
+# ============================================================
+# LOGIN
+# ============================================================
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+
+    if not data.get("email") or not data.get("password"):
+        return jsonify({"error": "Email and password required"}), 400
+
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("SELECT * FROM students WHERE email=%s", (data["email"],))
+    user = cur.fetchone()
+    db.close()
+
+    if not user:
+        return jsonify({"error": "User not found"}), 401
+
+    if not check_password_hash(user["password"], data["password"]):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    token = jwt.encode(
+        {
+            "uid": user["uid"],
+             "exp": datetime.utcnow() + timedelta(hours=12)
+        },
+        SECRET_KEY,
+        algorithm="HS256"
+    )
+
+    return jsonify({
+        "message": "Login successful",
+        "token": token,
+        "student": {
+            "name": user["name"],
+            "email": user["email"],
+            "uid": user["uid"],
+            "branch": user["branch"],
+            "year": user["year"]
+        }
+    }), 200
+
+# ============================================================
+# JWT DECORATOR
+# ============================================================
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+
+        # 🔥 1. ALLOW CORS PREFLIGHT
+        if request.method == "OPTIONS":
+            return jsonify({"success": True}), 200
+
+        auth_header = request.headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Token missing"}), 401
+
+        token = auth_header.replace("Bearer ", "")
+
+        try:
+            # 🔹 Decode JWT
+            data = jwt.decode(
+                token,
+                SECRET_KEY,
+                algorithms=["HS256"]
+            )
+
+            db = get_db()
+            cur = db.cursor()
+            cur.execute(
+                "SELECT * FROM students WHERE uid=%s",
+                (data["uid"],)
+            )
+            user = cur.fetchone()
+            db.close()
+
+            if not user:
+                return jsonify({"error": "Invalid token"}), 401
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+        return f(user, *args, **kwargs)
+
+    return decorated
+
+# ============================================================
+# GEMINI QUESTION GENERATOR
+# ============================================================
+
+
+
+# ============================================================
+# PROFILE
+# ============================================================
+@app.route("/get_student_profile", methods=["GET"])
+@token_required
+def get_student_profile(current_user):
+    try:
+        db = get_db()
+        cur = db.cursor()  # ✅ FIX 1
+
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+
+        attempts_table = (
+            "daily_quiz_attempts_y2" if year == 2
+            else "daily_quiz_attempts_y3"
+        )
+
+        # 🔹 Fetch attempts
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS total_attempts
+            FROM {attempts_table}
+            WHERE uid=%s
+            """,
+            (uid,)
+        )
+        attempts_row = cur.fetchone()
+        aptitude_attempted = attempts_row["total_attempts"] if attempts_row else 0
+
+        # 🔹 Fetch profile image FROM DB (NOT token)
+        cur.execute(
+            "SELECT name, branch, profile_image FROM students WHERE uid=%s",
+            (uid,)
+        )
+        student = cur.fetchone()
+
+        db.close()
+
+        profile_image = student["profile_image"]
+
+        # 🔥 FIX 2: convert to full URL
+        if profile_image:
+            profile_image = request.host_url.rstrip("/") + "/" + profile_image
+
+        return jsonify({
+            "success": True,
+            "profile": {
+                "name": student["name"],
+                "uid": uid,
+                "branch": student["branch"],
+                "year": year,
+                "profile_image": profile_image,
+                "aptitude_attempted": aptitude_attempted,
+                "branch_level": current_user.get("current_level", 1)
+            }
+        }), 200
+
+    except Exception as e:
+        print("❌ PROFILE ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/upload_profile_image", methods=["POST", "OPTIONS"])
+@token_required
+def upload_profile_image(current_user):
+
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    data = request.get_json()
+    image_base64 = data.get("image_base64")
+
+    if not image_base64:
+        return jsonify({"error": "Image missing"}), 400
+
+    # Remove base64 header if present
+    if "," in image_base64:
+        image_base64 = image_base64.split(",")[1]
+
+    img = base64.b64decode(image_base64)
+
+    db = get_db()
+    cur = db.cursor()
+
+    # 🔥 1️⃣ Fetch old image path
+    cur.execute(
+        "SELECT profile_image FROM students WHERE uid=%s",
+        (current_user["uid"],)
+    )
+    row = cur.fetchone()
+
+    old_image = row["profile_image"] if row else None
+
+    # 🔥 2️⃣ Delete old image file if exists
+    if old_image:
+        old_path = os.path.join(os.getcwd(), old_image)
+        if os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except Exception as e:
+                print("⚠️ Old image delete failed:", e)
+
+    # 🔥 3️⃣ Save new image
+    filename = f"{current_user['uid']}_{uuid.uuid4().hex}.jpg"
+    save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+
+    with open(save_path, "wb") as f:
+        f.write(img)
+
+    new_rel_path = f"uploads/profile_images/{filename}"
+
+    # 🔥 4️⃣ Update DB
+    cur.execute(
+        "UPDATE students SET profile_image=%s WHERE uid=%s",
+        (new_rel_path, current_user["uid"])
+    )
+    db.commit()
+    db.close()
+
+    return jsonify({
+        "success": True,
+        "profile_image": request.host_url.rstrip("/") + "/" + new_rel_path
+    }), 200
+
+
+from flask import send_from_directory
+
+@app.route("/uploads/profile_images/<path:filename>")
+def serve_profile_image(filename):
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        filename
+    )
+
+
+
+
+# ============================================================
+# LOGOUT
+# ============================================================
+@app.route("/logout", methods=["POST"])
+def logout():
+    return jsonify({"success": True}), 200
+
+
+
+
+FORGOT_OTP_TTL = 5 * 60
+forgot_otp_store = {}
+
+def load_html_template(filename, **kwargs):
+    template_path = os.path.join(os.getcwd(), filename)
+
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"{filename} not found")
+
+    with open(template_path, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    for key, value in kwargs.items():
+        html = html.replace(f"{{{{{key}}}}}", str(value))
+
+    return html
+
+
+
+@app.route("/forgot_password", methods=["POST"])
+def forgot_password():
+    data = request.get_json() or {}
+
+    uid = str(data.get("uid", "")).strip()
+    if not uid:
+        return jsonify({"error": "UID required"}), 400
+
+    # Fetch email from DB
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("SELECT email FROM students WHERE uid=%s", (uid,))
+    row = cur.fetchone()
+    db.close()
+
+    if not row:
+        return jsonify({"error": "UID not found"}), 404
+
+    email = row["email"]
 
     # Generate OTP
     otp = str(random.randint(100000, 999999))
-    if send_otp_email(email, otp):
-        # Store OTP temporarily
-        otp_collection.update_one(
-            {"email": email},
-            {"$set": {"otp": otp}},
-            upsert=True
+    expires = datetime.utcnow() + timedelta(seconds=FORGOT_OTP_TTL)
+
+
+    forgot_otp_store[uid] = {
+        "otp": otp,
+        "expires": expires,
+        "verified": False
+    }
+
+    # Load HTML template
+    html = load_html_template(
+        "forgototp.html",
+        otp=otp,
+        year=datetime.now().year
+    )
+
+    # Send email
+    send_email_smtp(
+        email,
+        "Password Reset OTP — Placement Portal",
+        html
+    )
+
+    print("FORGOT OTP (testing only):", otp)
+
+    return jsonify({"message": "OTP sent to registered email"}), 200
+
+
+    # send email
+    html = f"<h2>Your OTP is {otp}</h2><p>Valid for 5 minutes</p>"
+    send_email_smtp(email, "Password Reset OTP", html)
+
+    print("FORGOT OTP (testing only):", otp)
+    print("STORE AFTER SEND:", forgot_otp_store)
+
+    return jsonify({"message": "OTP sent to registered email"}), 200
+
+
+
+
+
+def load_template(otp, template_name):
+    template_path = os.path.join(os.getcwd(), template_name)
+
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"{template_name} not found")
+
+    with open(template_path, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    html = html.replace("{{otp}}", otp)
+    html = html.replace("{{year}}", str(datetime.now().year))
+    return html
+
+
+def send_email_smtp(to_email, subject, html_body):
+    if not SMTP_PASS:
+        raise Exception("BREVO_SMTP_PASS not set in environment")
+
+    msg = MIMEText(html_body, "html")
+    msg["Subject"] = subject
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+
+@app.route("/verify_forgot_otp", methods=["POST"])
+def verify_forgot_otp():
+    data = request.get_json() or {}
+
+    uid = str(data.get("uid", "")).strip()
+    otp = str(data.get("otp", "")).strip()
+
+    print("FORGOT STORE:", forgot_otp_store)
+    print("UID RECEIVED:", uid)
+
+    entry = forgot_otp_store.get(uid)
+
+    if not entry:
+        return jsonify({"error": "OTP not requested or expired"}), 400
+
+    if datetime.utcnow() > entry["expires"]:
+        del forgot_otp_store[uid]
+        return jsonify({"error": "OTP expired"}), 400
+
+    if otp != entry["otp"]:
+        return jsonify({"error": "Invalid OTP"}), 400
+
+    entry["verified"] = True
+    return jsonify({"message": "OTP verified"}), 200
+
+@app.route("/reset_password", methods=["POST"])
+def reset_password():
+    data = request.get_json() or {}
+
+    uid = str(data.get("uid", "")).strip()
+    new_password = data.get("new_password")
+    confirm_password = data.get("confirm_password")
+
+    if not uid or not new_password or not confirm_password:
+        return jsonify({"error": "All fields required"}), 400
+
+    if new_password != confirm_password:
+        return jsonify({"error": "Passwords do not match"}), 400
+
+    entry = forgot_otp_store.get(uid)
+
+    if not entry or not entry.get("verified"):
+        return jsonify({"error": "OTP not verified"}), 400
+
+    hashed = generate_password_hash(new_password)
+
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        "UPDATE students SET password=%s WHERE uid=%s",
+        (hashed, uid)
+    )
+    db.commit()
+    db.close()
+
+    del forgot_otp_store[uid]
+
+    return jsonify({"message": "Password reset successful"}), 200
+
+#/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#NO CHANGE ABOVE THIUS LINE
+#/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+def build_daily_mcq_prompt(topics, difficulty):
+    difficulty_map = {
+        "easy": "easy, basic, beginner-friendly",
+        "medium": "moderate, conceptual, exam-oriented",
+        "hard": "difficult, tricky, placement-level",
+        "very hard": "extremely difficult, trap-based, company-style"
+    }
+
+    difficulty_text = difficulty_map.get(
+        difficulty.lower(),
+        "difficult, placement-level"
+    )
+
+    return f"""
+Act as an elite AI placement MCQ generator for AI engineering students.
+
+Generate exactly 10 {difficulty_text} multiple choice questions.
+
+Topics strictly limited to:
+{topics}
+
+Rules:
+- One correct option only
+- No explanations
+- Questions must strictly match the difficulty level
+- Avoid repetition
+- Output STRICT JSON ONLY
+
+Format:
+[
+  {{
+    "question": "string",
+    "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+    "answer": "A"
+  }}
+]
+"""
+
+def generate_mcqs_from_ai(topics, difficulty):
+    try:
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        prompt = build_daily_mcq_prompt(topics, difficulty)
+
+        response = model.generate_content(prompt)
+
+        text = re.sub(r"```json|```", "", response.text.strip())
+        questions = json.loads(text)
+
+        if not isinstance(questions, list) or len(questions) != 10:
+            raise Exception("Invalid MCQ format")
+
+        return questions
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        return []
+
+    
+
+def cleanup_old_quiz(year, uid):
+    today = today_ist()
+
+    cache_table = f"daily_quiz_questions_y{year}"
+    bank_table = f"daily_quiz_questions_bank_y{year}"
+
+    db = get_db()
+    cur = db.cursor()
+
+    # 🔥 Delete previous-day cached questions
+    cur.execute(
+        f"""
+        DELETE FROM {cache_table}
+        WHERE uid=%s AND quiz_date < %s
+        """,
+        (uid, today)
+    )
+
+    # 🔥 Delete previous-day bank questions
+    cur.execute(
+        f"""
+        DELETE FROM {bank_table}
+        WHERE uid=%s AND quiz_date < %s
+        """,
+        (uid, today)
+    )
+
+    db.commit()
+    cur.close()
+    db.close()
+
+
+
+def get_daily_quiz(year, quiz_type, uid):
+    today = today_ist()
+
+    topic_table = f"daily_quiz_topics_y{year}"
+    cache_table = f"daily_quiz_questions_y{year}"
+    bank_table = f"daily_quiz_questions_bank_y{year}"
+    attempts_table = f"daily_quiz_attempts_y{year}"
+
+    db = get_db()
+    cur = db.cursor(pymysql.cursors.DictCursor)
+
+    # -------------------------------------------------
+    # 🔒 HARD BLOCK IF QUIZ ALREADY TOUCHED
+    # -------------------------------------------------
+    cur.execute(
+        f"""
+        SELECT id FROM {attempts_table}
+        WHERE uid=%s AND quiz_date=%s
+        """,
+        (uid, today)
+    )
+    if cur.fetchone():
+        db.close()
+        return {"attempted": True}
+
+    # -------------------------------------------------
+    # 🔐 LOCK QUIZ (ONLY ONCE)
+    # -------------------------------------------------
+    cur.execute(
+        f"""
+        INSERT INTO {attempts_table}
+        (uid, quiz_date, status, score, total, time_taken_seconds)
+        VALUES (%s, %s, 'started', 0, 0, 0)
+        """,
+        (uid, today)
+    )
+    db.commit()
+
+    # -------------------------------------------------
+    # FETCH TOPIC
+    # -------------------------------------------------
+    cur.execute(
+        f"""
+        SELECT topic, difficulty
+        FROM {topic_table}
+        WHERE quiz_date=%s AND quiz_type=%s
+        """,
+        (today, quiz_type)
+    )
+    topic_row = cur.fetchone()
+
+    if not topic_row:
+        db.close()
+        return []
+
+    db.close()
+
+    # -------------------------------------------------
+    # GENERATE QUESTIONS
+    # -------------------------------------------------
+    questions = generate_mcqs_from_ai(
+        topic_row["topic"],
+        topic_row["difficulty"]
+    )
+
+    if not questions:
+        return []
+
+    # -------------------------------------------------
+    # STORE QUESTIONS (BANK + CACHE)
+    # -------------------------------------------------
+    db = get_db()
+    cur = db.cursor(pymysql.cursors.DictCursor)
+
+    frontend_questions = []
+
+    for q in questions:
+        correct_answer_text = q["options"][ord(q["answer"]) - ord("A")]
+
+        cur.execute(
+            f"""
+            INSERT INTO {bank_table}
+            (quiz_date, uid, question_text, correct_answer)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (today, uid, q["question"], correct_answer_text)
         )
-        return jsonify({"message": "OTP sent to your email"}), 200
+
+        qid = cur.lastrowid
+        frontend_questions.append({
+            "question_id": qid,
+            "question": q["question"],
+            "options": q["options"]
+        })
+
+    # ✅ SAFE INSERT (NO DUPLICATE POSSIBLE NOW)
+    cur.execute(
+        f"""
+        INSERT INTO {cache_table}
+        (uid, quiz_date, quiz_type, questions_json)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (uid, today, quiz_type, json.dumps(frontend_questions))
+    )
+
+    db.commit()
+    db.close()
+
+    return frontend_questions
+
+
+
+
+
+
+def has_attempted_today(year, uid):
+    today = today_ist()
+    attempts_table = f"daily_quiz_attempts_y{year}"
+
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT 1
+        FROM {attempts_table}
+        WHERE uid=%s AND quiz_date=%s
+        LIMIT 1
+        """,
+        (uid, today)
+    )
+
+    attempted = cur.fetchone() is not None
+    cur.close()
+    db.close()
+
+    return attempted
+
+
+
+
+
+
+@app.route("/daily_quiz", methods=["GET", "OPTIONS"])
+@token_required
+def daily_quiz(current_user):
+
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    year = int(current_user["year"])
+    uid = current_user["uid"]
+    quiz_type = "placement"
+
+    # 🔒 BLOCK IF ALREADY ATTEMPTED
+    if has_attempted_today(year, uid):
+        return jsonify({
+            "success": False,
+            "attempted": True,
+            "message": "Quiz already attempted today"
+        }), 200
+
+    # ✅ Otherwise fetch questions
+    questions = get_daily_quiz(year, quiz_type, uid)
+
+    if not questions:
+        return jsonify({
+            "success": False,
+            "attempted": False,
+            "message": "No quiz today"
+        }), 404
+
+    return jsonify({
+        "success": True,
+        "attempted": False,
+        "quiz_date": str(today_ist()),
+        "quiz_type": quiz_type,
+        "questions": questions
+    }), 200
+
+   
+
+
+def resolve_tables(year):
+    year = str(year)
+
+    if year == "2":
+        return (
+            "daily_quiz_attempts_y2",
+            "daily_quiz_answers_y2",
+            "daily_quiz_questions_bank_y2"
+        )
+    elif year == "3":
+        return (
+            "daily_quiz_attempts_y3",
+            "daily_quiz_answers_y3",
+            "daily_quiz_questions_bank_y3"
+        )
     else:
-        return jsonify({"message": "Failed to send OTP"}), 500
+        raise ValueError("Invalid year")
 
-# Verify OTP
-@app.route('/verify_otp', methods=['POST'])
-def verify_otp():
-    data = request.get_json()
-    name = data.get("name")
-    branch = data.get("branch")
-    email = data.get("email")
-    year = data.get("year")
-    otp_input = data.get("otp")
 
-    if not all([name, branch, email, year, otp_input]):
-        return jsonify({"message": "All fields including OTP are required"}), 400
 
-    record = otp_collection.find_one({"email": email})
-    if not record or record["otp"] != otp_input:
-        return jsonify({"message": "Invalid OTP"}), 400
+@app.route("/api/profile/today", methods=["GET"])
+def profile_today():
+    uid = request.args.get("uid")
+    year = request.args.get("year")
 
-    # Save student to main collection
-    students_collection.insert_one({
-        "name": name,
-        "branch": branch,
-        "email": email,
-        "year": year
+    attempts_table, _, _ = resolve_tables(year)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        f"""
+        SELECT score, total, attempted_at
+        FROM {attempts_table}
+        WHERE uid=%s AND quiz_date=%s
+        """,
+        (uid, today_ist())
+    )
+
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        return jsonify({
+            "attempted": False,
+            "message": "Quiz not attempted today"
+        })
+
+    return jsonify({
+        "attempted": True,
+        "score": row["score"],
+        "total": row["total"],
+        "attempted_at": row["attempted_at"]
     })
 
-    # Remove OTP after successful verification
-    otp_collection.delete_one({"email": email})
-    return jsonify({"message": "Student registered successfully!"}), 200
+@app.route("/api/profile/review", methods=["GET"])
+def profile_review():
+    uid = request.args.get("uid")
+    year = request.args.get("year")
+    quiz_date = request.args.get("quiz_date")  # yyyy-mm-dd
 
-# Login route (email only)
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    email = data.get("email")
-    if not email:
-        return jsonify({"message": "Email required"}), 400
+    attempts_table, answers_table, questions_table = resolve_tables(year)
 
-    student = students_collection.find_one({"email": email})
-    if student:
-        return jsonify({"message": f"Welcome {student['name']}!"}), 200
-    else:
-        return jsonify({"message": "Email not registered"}), 400
+    conn = get_db()
+    cur = conn.cursor()
 
-if __name__ == '__main__':
-    import os
-    port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    # Step 1: Get attempt ID
+    cur.execute(
+        f"""
+        SELECT id
+        FROM {attempts_table}
+        WHERE uid=%s AND quiz_date=%s
+        """,
+        (uid, quiz_date)
+    )
+
+    attempt = cur.fetchone()
+    if not attempt:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Quiz not attempted"}), 403
+
+    attempt_id = attempt["id"]
+
+    # Step 2: Fetch questions + answers
+    cur.execute(
+        f"""
+        SELECT 
+            q.question_text,
+            q.correct_answer,
+            a.selected_answer,
+            a.is_correct
+        FROM {answers_table} a
+        JOIN {questions_table} q
+            ON a.question_id = q.id
+        WHERE a.attempt_id=%s
+        """,
+        (attempt_id,)
+    )
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify(rows)
+
+
+
+@app.route("/api/profile/status", methods=["GET"])
+def attempt_status():
+    uid = request.args.get("uid")
+    year = request.args.get("year")
+
+    attempts_table, _, _ = resolve_tables(year)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        f"""
+        SELECT 1
+        FROM {attempts_table}
+        WHERE uid=%s AND quiz_date=%s
+        """,
+        (uid, today_ist())
+    )
+
+    exists = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return jsonify({"attempted": bool(exists)})
+
+@app.route("/api/quiz/submit", methods=["POST", "OPTIONS"])
+@token_required
+def submit_quiz(current_user):
+
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    data = request.json or {}
+
+    uid = current_user["uid"]
+    year = int(current_user["year"])
+    answers = data.get("answers", [])
+    time_taken = data.get("time_taken_seconds")
+
+    if not answers:
+        return jsonify({"error": "No answers submitted"}), 400
+
+    attempts_table = f"daily_quiz_attempts_y{year}"
+    bank_table = f"daily_quiz_questions_bank_y{year}"
+
+    today = today_ist()
+
+    conn = get_db()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+
+    try:
+        # -------------------------------------------------
+        # 🔒 ALLOW SUBMIT ONLY IF STATUS = started
+        # -------------------------------------------------
+        cur.execute(
+            f"""
+            SELECT status FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            FOR UPDATE
+            """,
+            (uid, today)
+        )
+        attempt = cur.fetchone()
+
+        if not attempt or attempt["status"] != "started":
+            return jsonify({"error": "Quiz already closed"}), 409
+
+        # -------------------------------------------------
+        # FETCH CORRECT ANSWERS
+        # -------------------------------------------------
+        cur.execute(
+            f"""
+            SELECT id, correct_answer
+            FROM {bank_table}
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (uid, today)
+        )
+
+        rows = cur.fetchall()
+        if not rows:
+            return jsonify({"error": "Quiz not found"}), 400
+
+        correct_map = {r["id"]: r["correct_answer"] for r in rows}
+        total_questions = len(correct_map)
+
+        score = 0
+
+        for a in answers:
+            qid = int(a.get("question_id"))
+            selected = a.get("selected_answer")
+
+            cur.execute(
+                f"""
+                UPDATE {bank_table}
+                SET student_answer=%s
+                WHERE id=%s AND uid=%s AND quiz_date=%s
+                """,
+                (selected, qid, uid, today)
+            )
+
+            if selected and selected == correct_map.get(qid):
+                score += 1
+
+        # -------------------------------------------------
+        # 🔐 FINAL SUBMIT (LOCK FOREVER)
+        # -------------------------------------------------
+        cur.execute(
+            f"""
+            UPDATE {attempts_table}
+            SET score=%s,
+                total=%s,
+                time_taken_seconds=%s,
+                status='submitted'
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (score, total_questions, time_taken, uid, today)
+        )
+
+        conn.commit()
+
+        return jsonify({
+            "success": True,
+            "score": score,
+            "total": total_questions
+        }), 200
+
+    except Exception as e:
+        conn.rollback()
+        print("SUBMIT QUIZ ERROR:", repr(e))
+        return jsonify({"error": "Submission failed"}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+@app.route("/api/quiz/review", methods=["GET"])
+@token_required
+def quiz_review(current_user):
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+
+        bank_table = f"daily_quiz_questions_bank_y{year}"
+        attempts_table = f"daily_quiz_attempts_y{year}"
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        # 1️⃣ Get latest attempt
+        cur.execute(
+            f"""
+            SELECT quiz_date, score, total
+            FROM {attempts_table}
+            WHERE uid=%s
+            ORDER BY quiz_date DESC
+            LIMIT 1
+            """,
+            (uid,)
+        )
+        attempt = cur.fetchone()
+
+        if not attempt:
+            return jsonify({
+                "success": True,
+                "score": 0,
+                "total": 0,
+                "answers": []
+            }), 200
+
+        quiz_date = attempt["quiz_date"]
+
+        # 2️⃣ Fetch Q + correct + student answers
+        cur.execute(
+            f"""
+            SELECT
+                question_text AS question,
+                correct_answer,
+                student_answer
+            FROM {bank_table}
+            WHERE uid=%s AND quiz_date=%s
+            ORDER BY id ASC
+            """,
+            (uid, quiz_date)
+        )
+
+        rows = cur.fetchall()
+
+        answers = []
+        for r in rows:
+            answers.append({
+                "question": r["question"],
+                "your_answer": r["student_answer"],
+                "correct_answer": r["correct_answer"],
+                "is_correct": r["student_answer"] == r["correct_answer"]
+            })
+
+        return jsonify({
+            "success": True,
+            "score": attempt["score"],
+            "total": attempt["total"],
+            "answers": answers
+        }), 200
+
+    except Exception as e:
+        print("QUIZ REVIEW ERROR:", repr(e))
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    
+
+##################################################################################################################
+@app.route("/api/profile/marks_history", methods=["GET"])
+@token_required
+def marks_history(current_user):
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+
+        month = int(request.args.get("month"))
+        year_filter = int(request.args.get("year"))
+
+        attempts_table = (
+            "daily_quiz_attempts_y2" if year == 2
+            else "daily_quiz_attempts_y3"
+        )
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Fetch daily history
+        cur.execute(f"""
+            SELECT 
+                quiz_date,
+                score,
+                total
+            FROM {attempts_table}
+            WHERE uid=%s
+              AND MONTH(quiz_date)=%s
+              AND YEAR(quiz_date)=%s
+            ORDER BY quiz_date DESC
+        """, (uid, month, year_filter))
+
+        rows = cur.fetchall()
+
+        history = []
+        total_scored = 0
+        total_possible = 0
+
+        for r in rows:
+            total_scored += r["score"]
+            total_possible += r["total"]
+
+            history.append({
+                "quiz_date": r["quiz_date"].strftime("%Y-%m-%d"),
+                "score": r["score"],
+                "total": r["total"]
+            })
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "history": history,
+            "total_scored": total_scored,
+            "total_possible": total_possible
+        }), 200
+
+    except Exception as e:
+        print("MARKS HISTORY ERROR:", repr(e))
+        return jsonify({
+            "success": False,
+            "history": [],
+            "total_scored": 0,
+            "total_possible": 0
+        }), 200
+
+
+    
+
+@app.route("/api/leaderboard", methods=["GET"])
+@token_required
+def leaderboard(current_user):
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+
+        # IST current month & year
+        ist = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(ist)
+        current_month = now.month
+        current_year = now.year
+
+        # Year-wise table
+        attempts_table = (
+            "daily_quiz_attempts_y2" if year == 2
+            else "daily_quiz_attempts_y3"
+        )
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        # 🔥 TOP 10 STUDENTS (MONTH-WISE, YEAR-WISE)
+        cur.execute(f"""
+            SELECT 
+                s.name,
+                SUM(a.score) AS total_score
+            FROM {attempts_table} a
+            JOIN students s ON s.uid = a.uid
+            WHERE 
+                MONTH(a.quiz_date) = %s
+                AND YEAR(a.quiz_date) = %s
+            GROUP BY a.uid
+            ORDER BY total_score DESC
+            LIMIT 10
+        """, (current_month, current_year))
+
+        top10 = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "month": now.strftime("%B"),
+            "top10": top10
+        }), 200
+
+    except Exception as e:
+        print("LEADERBOARD ERROR:", repr(e))
+        return jsonify({
+            "success": False,
+            "top10": []
+        }), 200
+
+
+@app.route("/api/quiz/today/status", methods=["GET"])
+@token_required
+def today_quiz_status(current_user):
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+
+        attempts_table, _, _ = resolve_tables(year)
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        today = today_ist()
+
+        # 1️⃣ Check if quiz exists today
+        # (If your system always has daily quiz, keep this TRUE)
+        quiz_available = True
+
+        # 2️⃣ Check if already attempted
+        cur.execute(
+            f"""
+            SELECT id FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (uid, today)
+        )
+
+        attempted = cur.fetchone() is not None
+
+        return jsonify({
+            "available": quiz_available,
+            "attempted": attempted
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except:
+            pass
+
+
+
+#########################################################################################
+# faculty quiz routes
+#############################################################################################3
+
+import pymysql
+
+@app.route("/faculty_quiz", methods=["GET", "OPTIONS"])
+@token_required
+def faculty_quiz(current_user):
+
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    uid = current_user["uid"]
+    year = int(current_user["year"])
+    quiz_id = request.args.get("quiz_id", type=int)
+
+    if not quiz_id:
+        return jsonify({
+            "success": False,
+            "message": "quiz_id required"
+        }), 400
+
+    marks_table = (
+        "assignment_quiz_marks_y2"
+        if year == 2
+        else "assignment_quiz_marks_y3"
+    )
+
+    conn = get_db()
+    cur = conn.cursor(pymysql.cursors.Cursor)  # 🔒 FORCE TUPLE
+
+    # 1️⃣ Check quiz exists
+    cur.execute(
+        """
+        SELECT quiz_id
+        FROM faculty_quiz_master
+        WHERE quiz_id = %s AND year = %s
+        """,
+        (quiz_id, year),
+    )
+
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return jsonify({
+            "success": False,
+            "message": "Quiz not found"
+        }), 404
+
+    # 2️⃣ Check already attempted
+    cur.execute(
+        f"""
+        SELECT id
+        FROM {marks_table}
+        WHERE uid = %s AND quiz_id = %s
+        """,
+        (uid, quiz_id),
+    )
+
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return jsonify({
+            "success": True,
+            "attempted": True
+        }), 200
+
+    # 3️⃣ Fetch questions (SEND OLD FORMAT)
+    cur.execute(
+        """
+        SELECT
+            id,
+            question,
+            option_a,
+            option_b,
+            option_c,
+            option_d
+        FROM faculty_quiz_questions_new
+        WHERE quiz_id = %s
+        """,
+        (quiz_id,),
+    )
+
+    rows = cur.fetchall()
+    if not rows:
+        cur.close()
+        conn.close()
+        return jsonify({
+            "success": False,
+            "message": "No questions found"
+        }), 404
+
+    questions = []
+    for r in rows:
+        questions.append({
+            "question_id": r[0],
+            "question": r[1],
+            "option_a": r[2],
+            "option_b": r[3],
+            "option_c": r[4],
+            "option_d": r[5],
+        })
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "attempted": False,
+        "quiz_id": quiz_id,
+        "questions": questions
+    }), 200
+
+
+
+@app.route("/api/faculty_quiz/submit", methods=["POST"])
+@token_required
+def assignment_submit(current_user):
+    uid = current_user["uid"]
+    year = int(current_user["year"])
+
+    data = request.json or {}
+    answers = data.get("answers", [])
+    quiz_id = data.get("quiz_id")
+
+    if quiz_id is None:
+        return jsonify({"error": "Quiz ID missing"}), 400
+
+    # 🔥 Allow auto-submit even if answers are empty or partial
+    today = today_ist()
+
+    marks_table = (
+        "assignment_quiz_marks_y2"
+        if year == 2
+        else "assignment_quiz_marks_y3"
+    )
+
+    conn = get_db()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+
+    try:
+        # 🚫 Prevent reattempt
+        cur.execute(
+            f"""
+            SELECT id FROM {marks_table}
+            WHERE uid=%s AND quiz_id=%s
+            """,
+            (uid, quiz_id),
+        )
+        if cur.fetchone():
+            return jsonify({"error": "Quiz already submitted"}), 409
+
+        # 🧠 Extract question IDs safely
+        question_ids = [
+            a["question_id"]
+            for a in answers
+            if a.get("question_id") is not None
+        ]
+
+        score = 0
+        total_questions = len(question_ids)
+
+        correct_map = {}
+
+        if question_ids:
+            placeholders = ",".join(["%s"] * len(question_ids))
+
+            cur.execute(
+                f"""
+                SELECT id, correct_option
+                FROM faculty_quiz_questions_new
+                WHERE id IN ({placeholders})
+                """,
+                tuple(question_ids),
+            )
+
+            correct_map = {
+                r["id"]: r["correct_option"]
+                for r in cur.fetchall()
+            }
+
+            # ✅ Count only correct answers
+            for a in answers:
+                qid = a.get("question_id")
+                selected = a.get("selected_answer")
+
+                if selected is None:
+                    continue  # 🔥 unanswered allowed
+
+                if correct_map.get(qid) == selected:
+                    score += 1
+
+        # 🧾 Store attempt (ALWAYS)
+        cur.execute(
+            f"""
+            INSERT INTO {marks_table}
+            (uid, quiz_id, quiz_date, total_questions, score, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (uid, quiz_id, today, total_questions, score, "Admin"),
+        )
+
+        conn.commit()
+
+        return jsonify({
+            "success": True,
+            "score": score,
+            "total": total_questions
+        }), 200
+
+    except Exception as e:
+        conn.rollback()
+        print("FACULTY SUBMIT ERROR:", repr(e))
+        return jsonify({"error": "Submission failed"}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+@app.route("/api/profile/faculty_quiz/today", methods=["GET"])
+@token_required
+def faculty_quiz_today_marks(current_user):
+    uid = current_user["uid"]
+    year = int(current_user["year"])
+    today = today_ist()
+
+    quiz_table = "faculty_quiz_master"
+    marks_table = (
+        "assignment_quiz_marks_y2"
+        if year == 2
+        else "assignment_quiz_marks_y3"
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # 🔹 Find quizzes of today (NO is_active)
+    cur.execute(
+        f"""
+        SELECT quiz_id, quiz_date, quiz_start_time, quiz_end_time
+        FROM {quiz_table}
+        WHERE quiz_date = %s
+          AND year = %s
+        """,
+        (today, year),
+    )
+
+    quizzes = cur.fetchall()
+
+    if not quizzes:
+        return jsonify({"exists": False})
+
+    result = []
+
+    for q in quizzes:
+        quiz_id = q["quiz_id"]
+
+        # 🔹 Check if attempted
+        cur.execute(
+            f"""
+            SELECT score
+            FROM {marks_table}
+            WHERE uid=%s AND quiz_id=%s AND quiz_date=%s
+            """,
+            (uid, quiz_id, today),
+        )
+
+        mark = cur.fetchone()
+
+        result.append({
+            "quiz_id": quiz_id,
+            "quiz_date": q["quiz_date"].strftime("%Y-%m-%d"),
+            "quiz_start_time": str(q["quiz_start_time"]),
+            "quiz_end_time": str(q["quiz_end_time"]),
+            "attempted": True if mark else False,
+            "score": mark["score"] if mark else None
+        })
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        "exists": True,
+        "quizzes": result
+    })
+
+
+@app.route("/api/profile/faculty_quiz/history", methods=["GET"])
+@token_required
+def faculty_quiz_marks_history(current_user):
+    uid = str(current_user["uid"])
+    year = int(current_user["year"])
+
+    marks_table = (
+        "assignment_quiz_marks_y2"
+        if year == 2
+        else "assignment_quiz_marks_y3"
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # ✅ JOIN with faculty_quiz_master to get REAL quiz creator
+    cur.execute(
+        f"""
+        SELECT
+            m.quiz_id,
+            m.quiz_date,
+            m.score,
+            m.total_questions,
+            q.created_by AS quiz_created_by
+        FROM {marks_table} m
+        JOIN faculty_quiz_master q
+            ON m.quiz_id = q.quiz_id
+        WHERE m.uid = %s
+        ORDER BY m.quiz_date DESC
+        """,
+        (uid,),
+    )
+
+    rows = cur.fetchall()
+
+    history = []
+    for r in rows:
+        history.append({
+            "quiz_id": r["quiz_id"],
+            "quiz_date": r["quiz_date"].strftime("%Y-%m-%d"),
+            "score": r["score"],
+            "total_questions": r["total_questions"],
+            "created_by": r["quiz_created_by"],  # ✅ ALWAYS FACULTY NAME
+        })
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "history": history
+    })
+
+
+@app.route("/faculty_quiz/list", methods=["GET"])
+@token_required
+def faculty_quiz_list(current_user):
+    uid = current_user["uid"]
+    year = int(current_user["year"])
+    today = today_ist()
+
+    marks_table = (
+        "assignment_quiz_marks_y2"
+        if year == 2
+        else "assignment_quiz_marks_y3"
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # 1️⃣ Get ALL quizzes for TODAY (same as /faculty_quiz)
+    cur.execute(
+        """
+        SELECT
+            quiz_id,
+            quiz_date,
+            quiz_start_time,
+            quiz_end_time,
+            created_by
+        FROM faculty_quiz_master
+        WHERE quiz_date = %s
+          AND year = %s
+        ORDER BY quiz_start_time
+        """,
+        (today, year),
+    )
+
+    quizzes = cur.fetchall()
+
+    if not quizzes:
+        cur.close()
+        conn.close()
+        return jsonify({
+            "success": True,
+            "count": 0,
+            "quizzes": []
+        })
+
+    quiz_ids = [q["quiz_id"] for q in quizzes]
+
+    # 2️⃣ Find attempted quizzes by this student
+    placeholders = ",".join(["%s"] * len(quiz_ids))
+
+    cur.execute(
+        f"""
+        SELECT DISTINCT quiz_id
+        FROM {marks_table}
+        WHERE uid = %s
+          AND quiz_id IN ({placeholders})
+        """,
+        (uid, *quiz_ids),
+    )
+
+    attempted_rows = cur.fetchall()
+    attempted_ids = {r["quiz_id"] for r in attempted_rows}
+
+    result = []
+
+    # 3️⃣ Send only UNATTEMPTED quizzes
+    for q in quizzes:
+        if q["quiz_id"] in attempted_ids:
+            continue
+
+        result.append({
+            "quiz_id": q["quiz_id"],
+            "quiz_date": q["quiz_date"].strftime("%Y-%m-%d"),
+            "quiz_start_time": str(q["quiz_start_time"]),
+            "quiz_end_time": str(q["quiz_end_time"]),
+            "created_by": q["created_by"],
+            "attempted": False
+        })
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "count": len(result),
+        "quizzes": result
+    })
+
+# ============================================================
+# RUN SERVER
+# ============================================================
+if __name__ == "__main__":
+    app.run(
+        debug=False,
+        host="0.0.0.0",
+        port=5000
+    )
 
