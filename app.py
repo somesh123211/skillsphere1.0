@@ -524,7 +524,6 @@ def forgot_password():
     otp = str(random.randint(100000, 999999))
     expires = datetime.utcnow() + timedelta(seconds=FORGOT_OTP_TTL)
 
-
     forgot_otp_store[uid] = {
         "otp": otp,
         "expires": expires,
@@ -538,24 +537,21 @@ def forgot_password():
         year=datetime.now().year
     )
 
-    # Send email
-    send_email_smtp(
-        email,
-        "Password Reset OTP — Placement Portal",
-        html
-    )
+    # Send email (SAFE)
+    try:
+        send_email_smtp(
+            email,
+            "Password Reset OTP — Placement Portal",
+            html
+        )
+    except Exception as e:
+        print("❌ FORGOT OTP EMAIL ERROR:", repr(e))
+        return jsonify({
+            "error": "Failed to send OTP email. Please try again later."
+        }), 500
 
     print("FORGOT OTP (testing only):", otp)
-
-    return jsonify({"message": "OTP sent to registered email"}), 200
-
-
-    # send email
-    html = f"<h2>Your OTP is {otp}</h2><p>Valid for 5 minutes</p>"
-    send_email_smtp(email, "Password Reset OTP", html)
-
-    print("FORGOT OTP (testing only):", otp)
-    print("STORE AFTER SEND:", forgot_otp_store)
+    print("STORE:", forgot_otp_store)
 
     return jsonify({"message": "OTP sent to registered email"}), 200
 
