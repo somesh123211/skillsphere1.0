@@ -574,19 +574,32 @@ def load_template(otp, template_name):
 
 
 def send_email_smtp(to_email, subject, html_body):
-    if not SMTP_PASS:
-        raise Exception("BREVO_SMTP_PASS not set in environment")
+    try:
+        if not SMTP_PASS:
+            raise Exception("BREVO_SMTP_PASS not set")
 
-    msg = MIMEText(html_body, "html")
-    msg["Subject"] = subject
-    msg["From"] = FROM_EMAIL
-    msg["To"] = to_email
+        msg = MIMEText(html_body, "html")
+        msg["Subject"] = subject
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server = smtplib.SMTP(
+            SMTP_SERVER,
+            SMTP_PORT,
+            timeout=30
+        )
         server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
+        server.quit()
+
+        print("✅ Email sent to:", to_email)
+
+    except Exception as e:
+        print("❌ EMAIL ERROR:", repr(e))
+        raise
 
 
 @app.route("/verify_forgot_otp", methods=["POST"])
