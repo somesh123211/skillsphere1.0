@@ -573,31 +573,39 @@ def load_template(otp, template_name):
     return html
 
 
+import requests
+import os
+
 def send_email_smtp(to_email, subject, html_body):
-    try:
-        if not SMTP_PASS:
-            raise Exception("BREVO_SMTP_PASS not set")
+    api_key = os.getenv("BREVO_API_KEY")
+    if not api_key:
+        raise Exception("BREVO_API_KEY not set")
 
-        msg = MIMEText(html_body, "html")
-        msg["Subject"] = subject
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
+    url = "https://api.brevo.com/v3/smtp/email"
 
+    payload = {
+        "sender": {
+            "name": "SkillSphere",
+            "email": FROM_EMAIL
+        },
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body
+    }
 
-        server = smtplib.SMTP_SSL(
-            SMTP_SERVER,
-            SMTP_PORT,
-            timeout=30
-        )
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-        server.quit()
+    headers = {
+        "accept": "application/json",
+        "api-key": api_key,
+        "content-type": "application/json"
+    }
 
-        print("✅ Email sent to:", to_email)
+    response = requests.post(url, json=payload, headers=headers, timeout=15)
 
-    except Exception as e:
-        print("❌ EMAIL ERROR:", repr(e))
-        raise
+    if response.status_code not in (200, 201, 202):
+        raise Exception(f"Brevo API error: {response.text}")
+
+    print("✅ Email sent via Brevo API to:", to_email)
+
 
 
 
