@@ -354,7 +354,7 @@ def token_required(f):
 def get_student_profile(current_user):
     try:
         db = get_db()
-        cur = db.cursor()  # ✅ FIX 1
+        cur = db.cursor()
 
         uid = current_user["uid"]
         year = int(current_user["year"])
@@ -364,7 +364,7 @@ def get_student_profile(current_user):
             else "daily_quiz_attempts_y3"
         )
 
-        # 🔹 Fetch attempts
+        # 🔹 Fetch attempts count
         cur.execute(
             f"""
             SELECT COUNT(*) AS total_attempts
@@ -376,7 +376,7 @@ def get_student_profile(current_user):
         attempts_row = cur.fetchone()
         aptitude_attempted = attempts_row["total_attempts"] if attempts_row else 0
 
-        # 🔹 Fetch profile image FROM DB (NOT token)
+        # 🔹 Fetch student profile
         cur.execute(
             "SELECT name, branch, profile_image FROM students WHERE uid=%s",
             (uid,)
@@ -385,11 +385,26 @@ def get_student_profile(current_user):
 
         db.close()
 
+        if not student:
+            return jsonify({
+                "success": False,
+                "error": "Student not found"
+            }), 404
+
         profile_image = student["profile_image"]
 
-        # 🔥 FIX 2: convert to full URL
+        # ✅ FINAL FIX — DO NOT BREAK CLOUDINARY URL
         if profile_image:
-            profile_image = request.host_url.rstrip("/") + "/" + profile_image
+            if profile_image.startswith("http"):
+                # Cloudinary or external URL → use as-is
+                final_profile_image = profile_image
+            else:
+                # Local file path → convert to full URL
+                final_profile_image = (
+                    request.host_url.rstrip("/") + "/" + profile_image
+                )
+        else:
+            final_profile_image = None
 
         return jsonify({
             "success": True,
@@ -398,7 +413,7 @@ def get_student_profile(current_user):
                 "uid": uid,
                 "branch": student["branch"],
                 "year": year,
-                "profile_image": profile_image,
+                "profile_image": final_profile_image,
                 "aptitude_attempted": aptitude_attempted,
                 "branch_level": current_user.get("current_level", 1)
             }
@@ -406,7 +421,11 @@ def get_student_profile(current_user):
 
     except Exception as e:
         print("❌ PROFILE ERROR:", repr(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": "Internal server error"
+        }), 500
+
 
 @app.route("/upload_profile_image", methods=["POST", "OPTIONS"])
 @token_required
