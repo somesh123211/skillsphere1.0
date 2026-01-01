@@ -108,6 +108,18 @@ def get_db():
     )
 
 
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
+
+
+
 # ============================================================
 # OTP CONFIG (IN-MEMORY)
 # ============================================================
@@ -413,50 +425,36 @@ def upload_profile_image(current_user):
     if "," in image_base64:
         image_base64 = image_base64.split(",")[1]
 
-    img = base64.b64decode(image_base64)
+    try:
+        # 🔥 Upload to Cloudinary (NO LOCAL FILE)
+        result = cloudinary.uploader.upload(
+            base64.b64decode(image_base64),
+            folder="skillsphere/profile_images",
+            public_id=current_user["uid"],   # overwrite same user image
+            overwrite=True,
+            resource_type="image"
+        )
 
-    db = get_db()
-    cur = db.cursor()
+        image_url = result["secure_url"]
 
-    # 🔥 1️⃣ Fetch old image path
-    cur.execute(
-        "SELECT profile_image FROM students WHERE uid=%s",
-        (current_user["uid"],)
-    )
-    row = cur.fetchone()
+        # 🔥 Save Cloudinary URL in DB
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE students SET profile_image=%s WHERE uid=%s",
+            (image_url, current_user["uid"])
+        )
+        db.commit()
+        db.close()
 
-    old_image = row["profile_image"] if row else None
+        return jsonify({
+            "success": True,
+            "profile_image": image_url
+        }), 200
 
-    # 🔥 2️⃣ Delete old image file if exists
-    if old_image:
-        old_path = os.path.join(os.getcwd(), old_image)
-        if os.path.exists(old_path):
-            try:
-                os.remove(old_path)
-            except Exception as e:
-                print("⚠️ Old image delete failed:", e)
-
-    # 🔥 3️⃣ Save new image
-    filename = f"{current_user['uid']}_{uuid.uuid4().hex}.jpg"
-    save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-
-    with open(save_path, "wb") as f:
-        f.write(img)
-
-    new_rel_path = f"uploads/profile_images/{filename}"
-
-    # 🔥 4️⃣ Update DB
-    cur.execute(
-        "UPDATE students SET profile_image=%s WHERE uid=%s",
-        (new_rel_path, current_user["uid"])
-    )
-    db.commit()
-    db.close()
-
-    return jsonify({
-        "success": True,
-        "profile_image": request.host_url.rstrip("/") + "/" + new_rel_path
-    }), 200
+    except Exception as e:
+        print("❌ IMAGE UPLOAD ERROR:", repr(e))
+        return jsonify({"error": "Image upload failed"}), 500
 
 
 from flask import send_from_directory
