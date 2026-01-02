@@ -1076,6 +1076,39 @@ def has_attempted_today(year, uid):
 
 
 
+def has_attempted_today(year, uid):
+    conn = None
+    cur = None
+    try:
+        today = today_ist()
+        attempts_table = f"daily_quiz_attempts_y{year}"
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            f"""
+            SELECT 1
+            FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            LIMIT 1
+            """,
+            (uid, today)
+        )
+
+        return cur.fetchone() is not None
+
+    except Exception as e:
+        print("HAS ATTEMPTED ERROR:", repr(e))
+        # Safe default: assume attempted to prevent duplicate quiz
+        return True
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 
 @app.route("/daily_quiz", methods=["GET", "OPTIONS"])
@@ -1183,84 +1216,118 @@ def profile_today(current_user):
         if conn:
             conn.close()
 
-
 @app.route("/api/profile/review", methods=["GET"])
-def profile_review():
-    uid = request.args.get("uid")
-    year = request.args.get("year")
-    quiz_date = request.args.get("quiz_date")  # yyyy-mm-dd
+@token_required
+def profile_review(current_user):
+    conn = None
+    cur = None
+    try:
+        uid = current_user["uid"]              # 🔒 from token
+        year = request.args.get("year", type=int)
+        quiz_date = request.args.get("quiz_date")  # yyyy-mm-dd
 
-    attempts_table, answers_table, questions_table = resolve_tables(year)
+        if not year or not quiz_date:
+            return jsonify({"error": "year and quiz_date required"}), 400
 
-    conn = get_db()
-    cur = conn.cursor()
+        attempts_table, answers_table, questions_table = resolve_tables(year)
 
-    # Step 1: Get attempt ID
-    cur.execute(
-        f"""
-        SELECT id
-        FROM {attempts_table}
-        WHERE uid=%s AND quiz_date=%s
-        """,
-        (uid, quiz_date)
-    )
+        conn = get_db()
+        cur = conn.cursor()
 
-    attempt = cur.fetchone()
-    if not attempt:
-        cur.close()
-        conn.close()
-        return jsonify({"error": "Quiz not attempted"}), 403
+        # Step 1: Get attempt ID
+        cur.execute(
+            f"""
+            SELECT id
+            FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (uid, quiz_date)
+        )
 
-    attempt_id = attempt["id"]
+        attempt = cur.fetchone()
+        if not attempt:
+            return jsonify({"error": "Quiz not attempted"}), 404
 
-    # Step 2: Fetch questions + answers
-    cur.execute(
-        f"""
-        SELECT 
-            q.question_text,
-            q.correct_answer,
-            a.selected_answer,
-            a.is_correct
-        FROM {answers_table} a
-        JOIN {questions_table} q
-            ON a.question_id = q.id
-        WHERE a.attempt_id=%s
-        """,
-        (attempt_id,)
-    )
+        attempt_id = attempt["id"]
 
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        # Step 2: Fetch questions + answers
+        cur.execute(
+            f"""
+            SELECT 
+                q.question_text,
+                q.correct_answer,
+                a.selected_answer,
+                a.is_correct
+            FROM {answers_table} a
+            JOIN {questions_table} q
+                ON a.question_id = q.id
+            WHERE a.attempt_id=%s
+            """,
+            (attempt_id,)
+        )
 
-    return jsonify(rows)
+        rows = cur.fetchall()
+
+        return jsonify({
+            "success": True,
+            "review": rows
+        }), 200
+
+    except Exception as e:
+        print("PROFILE REVIEW ERROR:", repr(e))
+        return jsonify({"error": "Internal server error"}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 
 @app.route("/api/profile/status", methods=["GET"])
-def attempt_status():
-    uid = request.args.get("uid")
-    year = request.args.get("year")
+@token_required
+def attempt_status(current_user):
+    conn = None
+    cur = None
+    try:
+        uid = current_user["uid"]          # 🔒 from token
+        year = request.args.get("year", type=int)
 
-    attempts_table, _, _ = resolve_tables(year)
+        if not year:
+            return jsonify({"error": "year required"}), 400
 
-    conn = get_db()
-    cur = conn.cursor()
+        attempts_table, _, _ = resolve_tables(year)
 
-    cur.execute(
-        f"""
-        SELECT 1
-        FROM {attempts_table}
-        WHERE uid=%s AND quiz_date=%s
-        """,
-        (uid, today_ist())
-    )
+        conn = get_db()
+        cur = conn.cursor()
 
-    exists = cur.fetchone()
-    cur.close()
-    conn.close()
+        cur.execute(
+            f"""
+            SELECT 1
+            FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (uid, today_ist())
+        )
 
-    return jsonify({"attempted": bool(exists)})
+        exists = cur.fetchone()
+
+        return jsonify({
+            "attempted": bool(exists)
+        }), 200
+
+    except Exception as e:
+        print("PROFILE STATUS ERROR:", repr(e))
+        # Safe default: assume attempted to prevent duplicate quiz
+        return jsonify({"attempted": True}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 @app.route("/api/quiz/submit", methods=["POST", "OPTIONS"])
 @token_required
@@ -1614,49 +1681,11 @@ def leaderboard(current_user):
             conn.close()
 
 
+
+
+
+
 @app.route("/api/quiz/today/status", methods=["GET"])
-@token_required
-def today_quiz_status(current_user):
-    try:
-        uid = current_user["uid"]
-        year = int(current_user["year"])
-
-        attempts_table, _, _ = resolve_tables(year)
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        today = today_ist()
-
-        # 1️⃣ Check if quiz exists today
-        # (If your system always has daily quiz, keep this TRUE)
-        quiz_available = True
-
-        # 2️⃣ Check if already attempted
-        cur.execute(
-            f"""
-            SELECT id FROM {attempts_table}
-            WHERE uid=%s AND quiz_date=%s
-            """,
-            (uid, today)
-        )
-
-        attempted = cur.fetchone() is not None
-
-        return jsonify({
-            "available": quiz_available,
-            "attempted": attempted
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except:
-            pas@app.route("/api/quiz/today/status", methods=["GET"])
 @token_required
 def today_quiz_status(current_user):
     conn = None
