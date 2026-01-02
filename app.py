@@ -20,6 +20,8 @@ import uuid
 import smtplib
 from email.mime.text import MIMEText
 import google.generativeai as genai
+from db import get_db
+
 
 
 from datetime import datetime, date, timedelta
@@ -256,38 +258,52 @@ def login():
     if not data.get("email") or not data.get("password"):
         return jsonify({"error": "Email and password required"}), 400
 
-    db = get_db()
-    cur = db.cursor()
-    cur.execute("SELECT * FROM students WHERE email=%s", (data["email"],))
-    user = cur.fetchone()
-    db.close()
+    conn = None
+    cur = None
 
-    if not user:
-        return jsonify({"error": "User not found"}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    if not check_password_hash(user["password"], data["password"]):
-        return jsonify({"error": "Invalid credentials"}), 401
+        cur.execute(
+            "SELECT * FROM students WHERE email=%s",
+            (data["email"],)
+        )
+        user = cur.fetchone()
 
-    token = jwt.encode(
-        {
-            "uid": user["uid"],
-             "exp": datetime.utcnow() + timedelta(hours=12)
-        },
-        SECRET_KEY,
-        algorithm="HS256"
-    )
+        if not user:
+            return jsonify({"error": "User not found"}), 401
 
-    return jsonify({
-        "message": "Login successful",
-        "token": token,
-        "student": {
-            "name": user["name"],
-            "email": user["email"],
-            "uid": user["uid"],
-            "branch": user["branch"],
-            "year": user["year"]
-        }
-    }), 200
+        if not check_password_hash(user["password"], data["password"]):
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        token = jwt.encode(
+            {
+                "uid": user["uid"],
+                "exp": datetime.utcnow() + timedelta(hours=12)
+            },
+            SECRET_KEY,
+            algorithm="HS256"
+        )
+
+        return jsonify({
+            "message": "Login successful",
+            "token": token,
+            "student": {
+                "name": user["name"],
+                "email": user["email"],
+                "uid": user["uid"],
+                "branch": user["branch"],
+                "year": user["year"]
+            }
+        }), 200
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 # ============================================================
 # JWT DECORATOR
@@ -352,19 +368,21 @@ def token_required(f):
 @app.route("/get_student_profile", methods=["GET"])
 @token_required
 def get_student_profile(current_user):
+    conn = None
+    cur = None
     try:
-        db = get_db()
-        cur = db.cursor()
-
         uid = current_user["uid"]
         year = int(current_user["year"])
 
         attempts_table = (
-            "daily_quiz_attempts_y2" if year == 2
+            "daily_quiz_attempts_y2"
+            if year == 2
             else "daily_quiz_attempts_y3"
         )
 
-        # 🔹 Fetch attempts count
+        conn = get_db()
+        cur = conn.cursor()
+
         cur.execute(
             f"""
             SELECT COUNT(*) AS total_attempts
@@ -373,17 +391,13 @@ def get_student_profile(current_user):
             """,
             (uid,)
         )
-        attempts_row = cur.fetchone()
-        aptitude_attempted = attempts_row["total_attempts"] if attempts_row else 0
+        attempts = cur.fetchone()["total_attempts"]
 
-        # 🔹 Fetch student profile
         cur.execute(
             "SELECT name, branch, profile_image FROM students WHERE uid=%s",
             (uid,)
         )
         student = cur.fetchone()
-
-        db.close()
 
         if not student:
             return jsonify({
@@ -392,19 +406,8 @@ def get_student_profile(current_user):
             }), 404
 
         profile_image = student["profile_image"]
-
-        # ✅ FINAL FIX — DO NOT BREAK CLOUDINARY URL
-        if profile_image:
-            if profile_image.startswith("http"):
-                # Cloudinary or external URL → use as-is
-                final_profile_image = profile_image
-            else:
-                # Local file path → convert to full URL
-                final_profile_image = (
-                    request.host_url.rstrip("/") + "/" + profile_image
-                )
-        else:
-            final_profile_image = None
+        if profile_image and not profile_image.startswith("http"):
+            profile_image = request.host_url.rstrip("/") + "/" + profile_image
 
         return jsonify({
             "success": True,
@@ -413,8 +416,8 @@ def get_student_profile(current_user):
                 "uid": uid,
                 "branch": student["branch"],
                 "year": year,
-                "profile_image": final_profile_image,
-                "aptitude_attempted": aptitude_attempted,
+                "profile_image": profile_image,
+                "aptitude_attempted": attempts,
                 "branch_level": current_user.get("current_level", 1)
             }
         }), 200
@@ -425,6 +428,13 @@ def get_student_profile(current_user):
             "success": False,
             "error": "Internal server error"
         }), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 
 @app.route("/upload_profile_image", methods=["POST", "OPTIONS"])
@@ -986,40 +996,52 @@ def resolve_tables(year):
 
 
 @app.route("/api/profile/today", methods=["GET"])
-def profile_today():
-    uid = request.args.get("uid")
-    year = request.args.get("year")
+@token_required
+def profile_today(current_user):
+    conn = None
+    cur = None
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
 
-    attempts_table, _, _ = resolve_tables(year)
+        attempts_table, _, _ = resolve_tables(year)
 
-    conn = get_db()
-    cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-    cur.execute(
-        f"""
-        SELECT score, total, attempted_at
-        FROM {attempts_table}
-        WHERE uid=%s AND quiz_date=%s
-        """,
-        (uid, today_ist())
-    )
+        cur.execute(
+            f"""
+            SELECT score, total, attempted_at
+            FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (uid, today_ist())
+        )
 
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+        row = cur.fetchone()
 
-    if not row:
+        if not row:
+            return jsonify({
+                "attempted": False,
+                "message": "Quiz not attempted today"
+            }), 200
+
         return jsonify({
-            "attempted": False,
-            "message": "Quiz not attempted today"
-        })
+            "attempted": True,
+            "score": row["score"],
+            "total": row["total"],
+            "attempted_at": row["attempted_at"]
+        }), 200
 
-    return jsonify({
-        "attempted": True,
-        "score": row["score"],
-        "total": row["total"],
-        "attempted_at": row["attempted_at"]
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 @app.route("/api/profile/review", methods=["GET"])
 def profile_review():
@@ -1456,7 +1478,45 @@ def today_quiz_status(current_user):
             cur.close()
             conn.close()
         except:
-            pass
+            pas@app.route("/api/quiz/today/status", methods=["GET"])
+@token_required
+def today_quiz_status(current_user):
+    conn = None
+    cur = None
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+
+        attempts_table, _, _ = resolve_tables(year)
+        today = today_ist()
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            f"""
+            SELECT id FROM {attempts_table}
+            WHERE uid=%s AND quiz_date=%s
+            """,
+            (uid, today)
+        )
+
+        attempted = cur.fetchone() is not None
+
+        return jsonify({
+            "available": True,
+            "attempted": attempted
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 
 
@@ -1685,69 +1745,78 @@ def assignment_submit(current_user):
 @app.route("/api/profile/faculty_quiz/today", methods=["GET"])
 @token_required
 def faculty_quiz_today_marks(current_user):
-    uid = current_user["uid"]
-    year = int(current_user["year"])
-    today = today_ist()
+    conn = None
+    cur = None
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+        today = today_ist()
 
-    quiz_table = "faculty_quiz_master"
-    marks_table = (
-        "assignment_quiz_marks_y2"
-        if year == 2
-        else "assignment_quiz_marks_y3"
-    )
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    # 🔹 Find quizzes of today (NO is_active)
-    cur.execute(
-        f"""
-        SELECT quiz_id, quiz_date, quiz_start_time, quiz_end_time
-        FROM {quiz_table}
-        WHERE quiz_date = %s
-          AND year = %s
-        """,
-        (today, year),
-    )
-
-    quizzes = cur.fetchall()
-
-    if not quizzes:
-        return jsonify({"exists": False})
-
-    result = []
-
-    for q in quizzes:
-        quiz_id = q["quiz_id"]
-
-        # 🔹 Check if attempted
-        cur.execute(
-            f"""
-            SELECT score
-            FROM {marks_table}
-            WHERE uid=%s AND quiz_id=%s AND quiz_date=%s
-            """,
-            (uid, quiz_id, today),
+        quiz_table = "faculty_quiz_master"
+        marks_table = (
+            "assignment_quiz_marks_y2"
+            if year == 2
+            else "assignment_quiz_marks_y3"
         )
 
-        mark = cur.fetchone()
+        conn = get_db()
+        cur = conn.cursor()
 
-        result.append({
-            "quiz_id": quiz_id,
-            "quiz_date": q["quiz_date"].strftime("%Y-%m-%d"),
-            "quiz_start_time": str(q["quiz_start_time"]),
-            "quiz_end_time": str(q["quiz_end_time"]),
-            "attempted": True if mark else False,
-            "score": mark["score"] if mark else None
-        })
+        cur.execute(
+            """
+            SELECT quiz_id, quiz_date, quiz_start_time, quiz_end_time
+            FROM faculty_quiz_master
+            WHERE quiz_date=%s AND year=%s
+            """,
+            (today, year),
+        )
 
-    cur.close()
-    conn.close()
+        quizzes = cur.fetchall()
 
-    return jsonify({
-        "exists": True,
-        "quizzes": result
-    })
+        if not quizzes:
+            return jsonify({"exists": False}), 200
+
+        quiz_ids = [q["quiz_id"] for q in quizzes]
+        placeholders = ",".join(["%s"] * len(quiz_ids))
+
+        cur.execute(
+            f"""
+            SELECT quiz_id, score
+            FROM {marks_table}
+            WHERE uid=%s AND quiz_id IN ({placeholders})
+              AND quiz_date=%s
+            """,
+            (uid, *quiz_ids, today),
+        )
+
+        marks_map = {m["quiz_id"]: m["score"] for m in cur.fetchall()}
+
+        result = [
+            {
+                "quiz_id": q["quiz_id"],
+                "quiz_date": q["quiz_date"].strftime("%Y-%m-%d"),
+                "quiz_start_time": str(q["quiz_start_time"]),
+                "quiz_end_time": str(q["quiz_end_time"]),
+                "attempted": q["quiz_id"] in marks_map,
+                "score": marks_map.get(q["quiz_id"])
+            }
+            for q in quizzes
+        ]
+
+        return jsonify({
+            "exists": True,
+            "quizzes": result
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
 
 
 @app.route("/api/profile/faculty_quiz/history", methods=["GET"])
@@ -1807,89 +1876,87 @@ def faculty_quiz_marks_history(current_user):
 @app.route("/faculty_quiz/list", methods=["GET"])
 @token_required
 def faculty_quiz_list(current_user):
-    uid = current_user["uid"]
-    year = int(current_user["year"])
-    today = today_ist()
+    conn = None
+    cur = None
+    try:
+        uid = current_user["uid"]
+        year = int(current_user["year"])
+        today = today_ist()
 
-    marks_table = (
-        "assignment_quiz_marks_y2"
-        if year == 2
-        else "assignment_quiz_marks_y3"
-    )
+        marks_table = (
+            "assignment_quiz_marks_y2"
+            if year == 2
+            else "assignment_quiz_marks_y3"
+        )
 
-    conn = get_db()
-    cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-    # 1️⃣ Get ALL quizzes for TODAY (same as /faculty_quiz)
-    cur.execute(
-        """
-        SELECT
-            quiz_id,
-            quiz_date,
-            quiz_start_time,
-            quiz_end_time,
-            created_by
-        FROM faculty_quiz_master
-        WHERE quiz_date = %s
-          AND year = %s
-        ORDER BY quiz_start_time
-        """,
-        (today, year),
-    )
+        cur.execute(
+            """
+            SELECT quiz_id, quiz_date, quiz_start_time,
+                   quiz_end_time, created_by
+            FROM faculty_quiz_master
+            WHERE quiz_date=%s AND year=%s
+            ORDER BY quiz_start_time
+            """,
+            (today, year),
+        )
 
-    quizzes = cur.fetchall()
+        quizzes = cur.fetchall()
 
-    if not quizzes:
-        cur.close()
-        conn.close()
+        if not quizzes:
+            return jsonify({
+                "success": True,
+                "count": 0,
+                "quizzes": []
+            }), 200
+
+        quiz_ids = [q["quiz_id"] for q in quizzes]
+        placeholders = ",".join(["%s"] * len(quiz_ids))
+
+        cur.execute(
+            f"""
+            SELECT DISTINCT quiz_id
+            FROM {marks_table}
+            WHERE uid=%s AND quiz_id IN ({placeholders})
+            """,
+            (uid, *quiz_ids),
+        )
+
+        attempted_ids = {r["quiz_id"] for r in cur.fetchall()}
+
+        result = [
+            {
+                "quiz_id": q["quiz_id"],
+                "quiz_date": q["quiz_date"].strftime("%Y-%m-%d"),
+                "quiz_start_time": str(q["quiz_start_time"]),
+                "quiz_end_time": str(q["quiz_end_time"]),
+                "created_by": q["created_by"],
+                "attempted": False
+            }
+            for q in quizzes
+            if q["quiz_id"] not in attempted_ids
+        ]
+
         return jsonify({
             "success": True,
-            "count": 0,
-            "quizzes": []
-        })
+            "count": len(result),
+            "quizzes": result
+        }), 200
 
-    quiz_ids = [q["quiz_id"] for q in quizzes]
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    # 2️⃣ Find attempted quizzes by this student
-    placeholders = ",".join(["%s"] * len(quiz_ids))
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
-    cur.execute(
-        f"""
-        SELECT DISTINCT quiz_id
-        FROM {marks_table}
-        WHERE uid = %s
-          AND quiz_id IN ({placeholders})
-        """,
-        (uid, *quiz_ids),
-    )
 
-    attempted_rows = cur.fetchall()
-    attempted_ids = {r["quiz_id"] for r in attempted_rows}
 
-    result = []
-
-    # 3️⃣ Send only UNATTEMPTED quizzes
-    for q in quizzes:
-        if q["quiz_id"] in attempted_ids:
-            continue
-
-        result.append({
-            "quiz_id": q["quiz_id"],
-            "quiz_date": q["quiz_date"].strftime("%Y-%m-%d"),
-            "quiz_start_time": str(q["quiz_start_time"]),
-            "quiz_end_time": str(q["quiz_end_time"]),
-            "created_by": q["created_by"],
-            "attempted": False
-        })
-
-    cur.close()
-    conn.close()
-
-    return jsonify({
-        "success": True,
-        "count": len(result),
-        "quizzes": result
-    })
+@
 
 # ============================================================
 # RUN SERVER
