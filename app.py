@@ -271,20 +271,19 @@ def verify_otp_and_signup():
 # ============================================================
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json()
+    data = request.get_json() or {}
 
     if not data.get("email") or not data.get("password"):
         return jsonify({"error": "Email and password required"}), 400
 
     conn = None
     cur = None
-
     try:
         conn = get_db()
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT * FROM students WHERE email=%s",
+            "SELECT uid, name, email, branch, year, password FROM students WHERE email=%s",
             (data["email"],)
         )
         user = cur.fetchone()
@@ -295,9 +294,12 @@ def login():
         if not check_password_hash(user["password"], data["password"]):
             return jsonify({"error": "Invalid credentials"}), 401
 
+        # 🔐 JWT now contains minimal required identity data
         token = jwt.encode(
             {
                 "uid": user["uid"],
+                "year": user["year"],
+                "branch": user["branch"],
                 "exp": datetime.utcnow() + timedelta(hours=12)
             },
             SECRET_KEY,
@@ -323,6 +325,7 @@ def login():
             conn.close()
 
 
+
 # ============================================================
 # JWT DECORATOR
 # ============================================================
@@ -340,27 +343,20 @@ def token_required(f):
 
         token = auth_header.replace("Bearer ", "")
 
-        conn = None
-        cur = None
         try:
-            # 🔹 Decode JWT
+            # 🔹 Decode JWT (signature + expiry verified)
             data = jwt.decode(
                 token,
                 SECRET_KEY,
                 algorithms=["HS256"]
             )
 
-            conn = get_db()
-            cur = conn.cursor()
-
-            cur.execute(
-                "SELECT * FROM students WHERE uid=%s",
-                (data["uid"],)
-            )
-            user = cur.fetchone()
-
-            if not user:
-                return jsonify({"error": "Invalid token"}), 401
+            # 🔹 Construct user object (same shape as DB user)
+            user = {
+                "uid": data["uid"],
+                "year": data.get("year"),
+                "branch": data.get("branch")
+            }
 
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Token expired"}), 401
@@ -370,17 +366,12 @@ def token_required(f):
 
         except Exception as e:
             print("TOKEN ERROR:", repr(e))
-            return jsonify({"error": "Internal server error"}), 500
-
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
+            return jsonify({"error": "Authentication failed"}), 401
 
         return f(user, *args, **kwargs)
 
     return decorated
+
 
 
 # ============================================================

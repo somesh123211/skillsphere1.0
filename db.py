@@ -9,9 +9,7 @@ from dbutils.pooled_db import PooledDB
 # ------------------------------------------------------------------
 
 # Optional debug (comment out after first successful run)
-print("MYSQL_HOST =", os.getenv("MYSQL_HOST"))
-print("MYSQL_USER =", os.getenv("MYSQL_USER"))
-print("MYSQL_DB   =", os.getenv("MYSQL_DB"))
+
 
 # ------------------------------------------------------------------
 # DB CONNECTION POOL
