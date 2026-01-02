@@ -1,31 +1,38 @@
-from dbutils.pooled_db import PooledDB
+import os
 import pymysql
+from dbutils.pooled_db import PooledDB
 
-MYSQL_CONFIG = {
-    "host": "YOUR_HOST",
-    "user": "YOUR_USER",
-    "password": "YOUR_PASSWORD",
-    "database": "YOUR_DATABASE"
-}
+# ------------------------------------------------------------------
+# IMPORTANT:
+# - Environment variables MUST be loaded BEFORE this file is imported
+# - app.py must call load_dotenv() at the very top
+# ------------------------------------------------------------------
 
-# 🔥 DB CONNECTION POOL
+# Optional debug (comment out after first successful run)
+print("MYSQL_HOST =", os.getenv("MYSQL_HOST"))
+print("MYSQL_USER =", os.getenv("MYSQL_USER"))
+print("MYSQL_DB   =", os.getenv("MYSQL_DB"))
+
+# ------------------------------------------------------------------
+# DB CONNECTION POOL
+# ------------------------------------------------------------------
 pool = PooledDB(
     creator=pymysql,
-    maxconnections=10,      # max simultaneous connections
-    mincached=2,            # idle connections kept ready
-    maxcached=5,            # max idle connections
-    blocking=True,          # wait if pool exhausted
-    host=MYSQL_CONFIG["host"],
-    user=MYSQL_CONFIG["user"],
-    password=MYSQL_CONFIG["password"],
-    database=MYSQL_CONFIG["database"],
+    maxconnections=10,      # Max total connections
+    mincached=0,            # Do NOT pre-create connections (safe startup)
+    maxcached=5,            # Max idle connections
+    blocking=True,          # Wait if pool is exhausted
+    host=os.getenv("MYSQL_HOST"),
+    user=os.getenv("MYSQL_USER"),
+    password=os.getenv("MYSQL_PASSWORD"),
+    database=os.getenv("MYSQL_DB"),
     cursorclass=pymysql.cursors.DictCursor,
     autocommit=True
 )
 
 def get_db():
     """
-    Always returns a pooled connection.
-    .close() will RETURN it to pool (not destroy).
+    Returns a pooled database connection.
+    Calling .close() will RETURN the connection to the pool.
     """
     return pool.connection()
