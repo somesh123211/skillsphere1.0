@@ -1,47 +1,47 @@
-
 from locust import HttpUser, task, between
-import random
 
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjI1MTAxMDAxLCJleHAiOjE3Njc0MTM1MTR9.-IC9p235AeRH5Gv-d2iFXgbIgS7qdCYF_dcrNEuHO54"
+# ==============================
+# CONFIG
+# ==============================
+ADMIN_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbl91aWQiOiJiZDExMGNjMi04NjJiLTQyODEtYjcxZS0zOGI4YWYxNjAxNWQiLCJ0eXBlIjoiYWRtaW4iLCJleHAiOjE3Njc1NjgzOTV9.8E3HDI12I9AvmgzGpwR4t8VRtRR-xrl_myWIzKmRrSg"
 
+class AdminUser(HttpUser):
+    wait_time = between(1, 3)
 
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Content-Type": "application/json"
-}
+    def on_start(self):
+        # Use fixed JWT (no OTP, no login load)
+        self.headers = {
+            "Authorization": f"Bearer {ADMIN_JWT}"
+        }
 
-class SkillSphereStressUser(HttpUser):
-    # 🔥 very aggressive user behavior
-    wait_time = between(0.1, 0.5)
-
-    @task(5)
-    def dashboard_heavy(self):
-        self.client.get("/api/leaderboard", headers=HEADERS)
-        self.client.get("/api/quiz/today/status", headers=HEADERS)
+    # ==============================
+    # ADMIN DASHBOARD APIs
+    # ==============================
 
     @task(4)
-    def profile_heavy(self):
-        self.client.get("/get_student_profile", headers=HEADERS)
-        self.client.get("/api/profile/status?year=2", headers=HEADERS)
-
-    @task(3)
-    def review_heavy(self):
+    def students_year_2(self):
         self.client.get(
-            "/api/profile/review?year=2&quiz_date=2026-01-02",
-            headers=HEADERS
+            "/api/admin/students?year=2",
+            headers=self.headers
+        )
+
+    @task(4)
+    def students_year_3(self):
+        self.client.get(
+            "/api/admin/students?year=3",
+            headers=self.headers
         )
 
     @task(2)
-    def faculty_quiz_checks(self):
-        self.client.get("/api/profile/faculty_quiz/today", headers=HEADERS)
-        self.client.get("/api/profile/faculty_quiz/history", headers=HEADERS)
+    def faculty_quiz_master(self):
+        self.client.get(
+            "/api/admin/faculty-quiz/master",
+            headers=self.headers
+        )
 
     @task(1)
-    def random_noise(self):
-        # simulate unpredictable user behavior
-        choice = random.choice([
-            "/api/leaderboard",
-            "/api/quiz/today/status",
-            "/get_student_profile"
-        ])
-        self.client.get(choice, headers=HEADERS)
+    def daily_leaderboard(self):
+        self.client.get(
+            "/api/admin/leaderboard/daily?year=2&type=all",
+            headers=self.headers
+        )
