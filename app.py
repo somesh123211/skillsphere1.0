@@ -4004,57 +4004,6 @@ def admin_daily_quiz_leaderboard(current_user):
         "data": rows
     }), 200
 
-@app.route("/api/admin/daily-quiz/topic/delete", methods=["POST", "OPTIONS"])
-@admin_token_required
-def delete_daily_quiz_topic(admin):
-
-    if request.method == "OPTIONS":
-        return jsonify({"success": True}), 200
-
-    data = request.get_json(silent=True) or {}
-
-    year = data.get("year")
-    quiz_date = data.get("quiz_date")
-
-    if year not in [2, 3]:
-        return jsonify({"error": "Invalid year"}), 400
-
-    if not quiz_date:
-        return jsonify({"error": "Quiz date required"}), 400
-
-    table = "daily_quiz_topics_y2" if year == 2 else "daily_quiz_topics_y3"
-
-    conn = None
-    cur = None
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
-            f"SELECT id FROM {table} WHERE quiz_date=%s",
-            (quiz_date,)
-        )
-        if not cur.fetchone():
-            return jsonify({"error": "No quiz found for this date"}), 404
-
-        cur.execute(
-            f"DELETE FROM {table} WHERE quiz_date=%s",
-            (quiz_date,)
-        )
-
-        return jsonify({
-            "success": True,
-            "message": "Quiz topic removed successfully"
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()   # 🔥 return to pool
 
 # ============================================================
 # RUN SERVER
