@@ -2186,11 +2186,13 @@ if __name__ == "__main__":
 ##########################################################################
 
 # ============================================================
+# ============================================================
 # ADMIN BACKEND - AUTH + DASHBOARD + FORGOT PASSWORD (OTP)
 # ============================================================
 
 # -------------------- BASIC IMPORTS -------------------------
-
+from dotenv import load_dotenv
+load_dotenv() 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -2212,7 +2214,7 @@ from db import get_db
 # ============================================================
 # LOAD ENV
 # ============================================================
-
+load_dotenv()
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 SMTP_PASS = os.getenv("BREVO_SMTP_PASS")
@@ -2238,7 +2240,9 @@ BREVO_API_KEY = os.getenv("ADMIN_KEY")
 # ============================================================
 # FLASK SETUP
 # ============================================================
-
+app = Flask(__name__)
+app.config["SECRET_KEY"] = SECRET_KEY
+CORS(app)
 
 # ============================================================
 # TIMEZONE + OTP CONFIG
@@ -2404,7 +2408,7 @@ def admin_login():
         return jsonify({"error": "Invalid credentials"}), 401
 
     # 🔐 Generate OTP
-    otp = generate_otp_admin()
+    otp = generate_otp()
     expires_at = datetime.utcnow() + timedelta(minutes=5)
 
     admin_login_otp_store[email] = {
@@ -2488,10 +2492,10 @@ def verify_admin_login_otp():
 # ============================================================
 # OTP HELPERS
 # ============================================================
-def generate_otp_admin():
+def generate_otp():
     return str(random.randint(100000, 999999))
 
-def load_html_template_admin(filename, **kwargs):
+def load_html_template(filename, **kwargs):
     template_path = os.path.join(
         os.path.dirname(__file__),
         "templates",
@@ -2524,7 +2528,7 @@ def send_otp_email(email, otp):
         print("ADMIN_KEY not set")
         return False
 
-    html = load_html_template_admin(
+    html = load_html_template(
         "admin_otp_template.html",
         otp=otp,
         year=datetime.now().year
@@ -2602,7 +2606,7 @@ def admin_resend_otp():
         return jsonify({"error": "Admin email not found"}), 404
 
     # 🔄 Generate NEW OTP
-    otp = generate_otp_admin()
+    otp = generate_otp()
     now_ist = datetime.now(IST)
     expires_at = now_ist + timedelta(minutes=ADMIN_OTP_VALID_MINUTES)
 
@@ -2645,7 +2649,7 @@ def admin_forgot_password():
     if not admin:
         return jsonify({"error": "Admin email not found"}), 404
 
-    otp = generate_otp_admin()
+    otp = generate_otp()
     now_ist = datetime.now(IST)
     expires_at = now_ist + timedelta(minutes=ADMIN_OTP_VALID_MINUTES)
 
@@ -2818,6 +2822,67 @@ def get_single_student(admin, uid):
             cur.close()
         if conn:
             conn.close()   # 🔥 return to pool
+
+
+
+@app.route("/api/admin/student/<uid>/delete", methods=["DELETE", "OPTIONS"])
+@admin_token_required
+def delete_student(admin, uid):
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        conn.begin()
+        cur = conn.cursor()
+
+        # 1. Delete daily quiz answers & attempts for Y2
+        cur.execute("""
+            DELETE FROM daily_quiz_answers_y2 
+            WHERE attempt_id IN (SELECT id FROM daily_quiz_attempts_y2 WHERE uid = %s)
+        """, (uid,))
+        cur.execute("DELETE FROM daily_quiz_attempts_y2 WHERE uid = %s", (uid,))
+
+        # 2. Delete daily quiz answers & attempts for Y3
+        cur.execute("""
+            DELETE FROM daily_quiz_answers_y3 
+            WHERE attempt_id IN (SELECT id FROM daily_quiz_attempts_y3 WHERE uid = %s)
+        """, (uid,))
+        cur.execute("DELETE FROM daily_quiz_attempts_y3 WHERE uid = %s", (uid,))
+
+        # 3. Delete assignment quiz marks for Y2 & Y3
+        cur.execute("DELETE FROM assignment_quiz_marks_y2 WHERE uid = %s", (uid,))
+        cur.execute("DELETE FROM assignment_quiz_marks_y3 WHERE uid = %s", (uid,))
+
+        # 4. Delete from branchquiz
+        cur.execute("DELETE FROM branchquiz WHERE uid_number = %s", (uid,))
+
+        # 5. Delete from quiz_results
+        cur.execute("DELETE FROM quiz_results WHERE uid_number = %s", (uid,))
+
+        # 6. Delete the student record
+        cur.execute("DELETE FROM students WHERE uid = %s", (uid,))
+
+        conn.commit()
+        return jsonify({
+            "success": True,
+            "message": "Student and all associated records deleted successfully"
+        }), 200
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 
@@ -4010,7 +4075,5 @@ def admin_daily_quiz_leaderboard(current_user):
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
+
